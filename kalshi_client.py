@@ -6,6 +6,7 @@ Docs: https://docs.kalshi.com/getting_started/api_keys
 import base64
 import datetime
 import logging
+import uuid
 from typing import Optional
 
 import requests
@@ -66,6 +67,8 @@ class KalshiClient:
     def _post(self, path: str, body: dict) -> dict:
         url = f"{self.base_url}{path}"
         resp = self.session.post(url, json=body, headers=self._auth_headers("POST", path))
+        if not resp.ok:
+            logger.error(f"POST {path} {resp.status_code}: {resp.text}")
         resp.raise_for_status()
         return resp.json()
 
@@ -123,14 +126,15 @@ class KalshiClient:
         price_cents: int,
         order_type: str = "limit",
     ) -> dict:
+        yes_price = price_cents if side == "yes" else (100 - price_cents)
         body = {
             "ticker": ticker,
+            "client_order_id": str(uuid.uuid4()),
             "action": action,
             "side": side,
             "count": contracts,
             "type": order_type,
-            "yes_price": price_cents if side == "yes" else (100 - price_cents),
-            "no_price": price_cents if side == "no" else (100 - price_cents),
+            "yes_price": yes_price,
         }
         if config.DRY_RUN:
             logger.info(f"[DRY RUN] Would place order: {body}")
@@ -146,6 +150,27 @@ class KalshiClient:
     def get_open_orders(self) -> list[dict]:
         data = self._get("/portfolio/orders", params={"status": "resting"})
         return data.get("orders", [])
+
+    # ── Spot prices ───────────────────────────────────────────────────────────
+
+    def get_spot_prices(self) -> dict:
+        """Fetch BTC and ETH spot prices from CoinGecko (free, no API key needed).
+        Returns e.g. {"KXBTCD": 68200.0, "KXETH": 2050.0}"""
+        try:
+            resp = requests.get(
+                "https://api.coingecko.com/api/v3/simple/price",
+                params={"ids": "bitcoin,ethereum", "vs_currencies": "usd"},
+                timeout=5,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return {
+                "KXBTCD": data.get("bitcoin", {}).get("usd"),
+                "KXETH":  data.get("ethereum", {}).get("usd"),
+            }
+        except Exception as e:
+            logger.warning(f"Failed to fetch spot prices: {e}")
+            return {}
 
     # ── Helpers ───────────────────────────────────────────────────────────────
     # Kalshi orderbook structure:

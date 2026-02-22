@@ -16,6 +16,7 @@ Extend these or add your own by subclassing BaseStrategy.
 import logging
 import math
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Optional
 from kalshi_client import KalshiClient
 import config
@@ -61,14 +62,32 @@ class MeanReversionStrategy(BaseStrategy):
               historical base rates) giving you a prior belief.
     """
 
-    # Map series prefix → your prior probability estimate (0.0–1.0)
-    # Tune these based on external data / research.
+    # Map substring of ticker → your prior probability estimate (0.0–1.0).
+    #
+    # IMPORTANT: Only add a prior if you have a real external basis for it
+    # (economist forecasts, historical base rates, etc.). A wrong prior
+    # creates fake edge and will lose money. If unsure, leave it out and
+    # let MomentumStrategy handle that market instead.
+    #
+    # KXFED tickers look like: KXFED-26MAR19-T4.25
+    # Check the Kalshi site for exact threshold labels before adding priors.
+    # KXFED tickers: KXFED-{MEETING_DATE}-T{RATE}
+    # Each market asks "Will the upper bound of the fed funds rate be ABOVE T%
+    # at the given FOMC meeting?"
+    #
+    # Set priors based on current rate + expected path.
+    # Current upper bound as of Feb 2026: ~4.25%. Rates expected to drift down.
+    # Verify/update these numbers before going live — check CME FedWatch tool.
     PRIORS = {
-        "FED-PAUSE":   0.70,   # Fed likely to hold rates
-        "FED-HIKE":    0.10,
-        "FED-CUT":     0.20,
-        "CPI-":        0.50,   # neutral for generic CPI markets
-        "INXD-":       0.50,   # S&P daily move: roughly 50/50
+        "KXFED-T4.50": 0.10,  # above 4.50% — unlikely, would need a hike
+        "KXFED-T4.25": 0.30,  # above 4.25% — possible if cuts are paused
+        "KXFED-T4.00": 0.55,  # above 4.00% — roughly coin flip
+        "KXFED-T3.75": 0.72,  # above 3.75% — more likely than not
+        "KXFED-T3.50": 0.85,  # above 3.50% — likely
+        "KXFED-T3.25": 0.92,  # above 3.25% — very likely
+        "KXFED-T3.00": 0.96,  # above 3.00% — near certain
+        # DO NOT add a blanket CPI prior — thresholds vary too much per release.
+        # DO NOT add crypto/Nasdaq priors — let MomentumStrategy handle those.
     }
 
     def _get_prior(self, ticker: str) -> Optional[float]:
@@ -291,5 +310,124 @@ Additional context: {context}
             contracts=contracts,
             limit_price=limit_price,
             reason=f"gemini_sentiment | gemini={prior:.2f} market={market_prob:.2f}",
+            edge=abs(edge),
+        )
+
+
+# ── Strategy 4: Crypto Price Model ────────────────────────────────────────────
+
+class CryptoPriceStrategy(BaseStrategy):
+    """
+    Uses the real-time BTC/ETH spot price to estimate the probability that a
+    daily contract resolves YES, then trades when the market price diverges.
+
+    Model: assumes log-normal price, scales daily volatility by sqrt(hours_left/24)
+    to get a fair-value probability for each threshold contract.
+
+    Only fires on near-the-money contracts (within CRYPTO_NEAR_MONEY_PCT of spot)
+    where the probability estimate is most reliable and markets most liquid.
+
+    Set spot_prices before each cycle: strategy.spot_prices = client.get_spot_prices()
+    """
+
+    def __init__(self, client: KalshiClient):
+        super().__init__(client)
+        self.spot_prices: dict = {}  # updated each cycle by bot.py
+
+    @staticmethod
+    def _norm_cdf(x: float) -> float:
+        """Standard normal CDF via math.erf."""
+        return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+    def _prob_above(self, spot: float, threshold: float, hours: float, daily_vol: float) -> float:
+        """P(price > threshold at expiry) using log-normal model."""
+        t = max(hours, 0.1) / 24.0          # fraction of a day
+        vol = daily_vol * math.sqrt(t)
+        if vol == 0:
+            return 1.0 if spot > threshold else 0.0
+        d = math.log(spot / threshold) / vol
+        return max(0.01, min(0.99, self._norm_cdf(d)))
+
+    def _hours_to_expiry(self, market: dict) -> float:
+        t = market.get("close_time") or market.get("expiration_time")
+        if not t:
+            return 24.0
+        close = datetime.fromisoformat(t.replace("Z", "+00:00"))
+        return max(0.1, (close - datetime.now(timezone.utc)).total_seconds() / 3600)
+
+    def _parse_ticker(self, ticker: str):
+        """
+        Returns (series, threshold, direction) from a ticker like:
+          KXBTCD-26FEB2717-T76499.99  → ("KXBTCD", 76499.99, "above")
+          KXETH-26FEB2118-B1960       → ("KXETH",  1960.0,   "below")
+        Returns None on parse failure.
+        """
+        parts = ticker.split("-")
+        if len(parts) < 3:
+            return None
+        series = parts[0]
+        raw = parts[-1]           # e.g. "T76499.99" or "B1960"
+        if not raw or raw[0] not in ("T", "B"):
+            return None
+        try:
+            threshold = float(raw[1:])
+        except ValueError:
+            return None
+        direction = "above" if raw[0] == "T" else "below"
+        return series, threshold, direction
+
+    def analyze(self, market: dict) -> Optional[TradeSignal]:
+        ticker = market["ticker"]
+        parsed = self._parse_ticker(ticker)
+        if parsed is None:
+            return None
+        series, threshold, direction = parsed
+
+        spot = self.spot_prices.get(series)
+        if not spot:
+            return None
+
+        # Only trade near-the-money contracts
+        if abs(spot - threshold) / spot > config.CRYPTO_NEAR_MONEY_PCT:
+            return None
+
+        daily_vol = config.CRYPTO_DAILY_VOL.get(series, 0.04)
+        hours = self._hours_to_expiry(market)
+        prob_above = self._prob_above(spot, threshold, hours, daily_vol)
+        prior = prob_above if direction == "above" else (1.0 - prob_above)
+
+        orderbook = self.client.get_orderbook(ticker)
+        mid = self.client.mid_price(orderbook)
+        if mid is None:
+            return None
+
+        market_prob = mid / 100
+        edge = prior - market_prob
+
+        if abs(edge) < config.MIN_EDGE:
+            return None
+
+        if edge > 0:
+            side, action = "yes", "buy"
+            limit_price = math.floor(mid)
+        else:
+            side, action = "no", "buy"
+            limit_price = math.floor(100 - mid)
+
+        contracts = self.contracts_from_budget(limit_price, config.MAX_TRADE_USD)
+        if contracts == 0:
+            return None
+
+        return TradeSignal(
+            ticker=ticker,
+            side=side,
+            action=action,
+            contracts=contracts,
+            limit_price=limit_price,
+            reason=(
+                f"crypto_price | spot={spot:.0f} threshold={threshold:.0f} "
+                f"({direction}) prior={prior:.2f} market={market_prob:.2f} "
+                f"hours_left={hours:.1f}"
+            ),
             edge=abs(edge),
         )

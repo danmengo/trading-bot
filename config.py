@@ -30,17 +30,35 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")  # empty = AI sentiment disable
 # and always have a cash buffer. $2.50 × 3 positions = $7.50 max exposure.
 MAX_TRADE_USD = 2.50
 MIN_EDGE = 0.05
-MAX_OPEN_POSITIONS = 3
-POLL_INTERVAL_SECONDS = 60
+MAX_OPEN_POSITIONS = 10000  # set to a low number (e.g. 3) to cap concurrent positions
+POLL_INTERVAL_SECONDS = 300  # 5 minutes — daily contracts don't reprice faster than this
+ORDER_CANCEL_AFTER_MINUTES = 20  # cancel unfilled resting orders after this long
+
+# Specific market tickers to always trade regardless of series filters.
+# Add any ticker you want to target directly, e.g. "KXBTCD-26FEB2717-T76499.99"
+WATCHED_TICKERS = []
 
 WATCHED_SERIES = [
-    "FED-",       # Fed rate decisions (active around FOMC meetings)
-    "CPI-",       # CPI reports
-    "INXD-",      # S&P 500 daily
-    "KXBTCD-",    # Bitcoin daily
-    "HIGHNY-",    # NYC daily high temp (always open)
-    "NASDAQ100-", # Nasdaq daily
+    "KXBTCD",  # Bitcoin daily
+    "KXETH",   # Ethereum daily
 ]
+
+# Only trade contracts expiring within this many days.
+SERIES_MAX_DAYS_TO_EXPIRY = {
+    "KXBTCD": 7,
+    "KXETH":  7,
+}
+
+# ── Crypto price strategy ──────────────────────────────────────────────────────
+# Only trade contracts whose threshold is within this % of the current spot price.
+# Tighter = fewer but higher-quality near-the-money trades.
+CRYPTO_NEAR_MONEY_PCT = 0.08  # 8% from spot price
+
+# Assumed daily volatility per asset (tune based on observed market behaviour).
+CRYPTO_DAILY_VOL = {
+    "KXBTCD": 0.035,  # BTC: ~3.5% daily vol
+    "KXETH":  0.045,  # ETH: ~4.5% daily vol
+}
 
 # ── Risk management ───────────────────────────────────────────────────────────
 # Stop the bot if you lose more than this in a session (~38% of bankroll)
