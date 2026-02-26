@@ -324,15 +324,69 @@ class CryptoPriceStrategy(BaseStrategy):
     Model: assumes log-normal price, scales daily volatility by sqrt(hours_left/24)
     to get a fair-value probability for each threshold contract.
 
-    Only fires on near-the-money contracts (within CRYPTO_NEAR_MONEY_PCT of spot)
-    where the probability estimate is most reliable and markets most liquid.
+    Volatility is auto-calibrated from 30-day realized vol on startup using
+    CoinGecko daily price history. Falls back to config.CRYPTO_DAILY_VOL if
+    the fetch fails.
+
+    Edge threshold is widened by half the bid-ask spread so that illiquid
+    markets (wide spread = unreliable mid) require a stronger signal to trade.
+    Markets with spread > CRYPTO_MAX_SPREAD_CENTS are skipped entirely.
 
     Set spot_prices before each cycle: strategy.spot_prices = client.get_spot_prices()
     """
 
+    # Maps Kalshi series prefix → CoinGecko coin ID
+    _COIN_IDS = {
+        "KXBTCD": "bitcoin",
+        "KXETH":  "ethereum",
+    }
+
     def __init__(self, client: KalshiClient):
         super().__init__(client)
         self.spot_prices: dict = {}  # updated each cycle by bot.py
+        self._realized_vols: dict = {}  # series → calibrated daily vol
+        self._refresh_vols()
+
+    def _refresh_vols(self):
+        """
+        Fetch 30-day daily price history from CoinGecko and compute realized
+        daily volatility for each watched series. Falls back to config values
+        if the fetch fails or there is insufficient data.
+        """
+        for series, coin_id in self._COIN_IDS.items():
+            prices = self.client.get_price_history(coin_id, days=30)
+            vol = self._compute_daily_vol(prices)
+            if vol is not None:
+                self._realized_vols[series] = vol
+                logger.info(
+                    f"Vol calibrated [{series}]: {vol:.4f} daily "
+                    f"({vol * 100:.2f}%/day, {vol * math.sqrt(252) * 100:.1f}% annualized)"
+                )
+            else:
+                fallback = config.CRYPTO_DAILY_VOL.get(series, 0.04)
+                self._realized_vols[series] = fallback
+                logger.warning(
+                    f"Vol calibration failed [{series}] — using config fallback {fallback:.4f}"
+                )
+
+    @staticmethod
+    def _compute_daily_vol(prices: list[float]) -> Optional[float]:
+        """
+        Compute realized daily volatility from daily closing prices.
+        Returns sample std dev of log returns, or None if insufficient data.
+        """
+        if len(prices) < 5:
+            return None
+        log_returns = [
+            math.log(prices[i] / prices[i - 1])
+            for i in range(1, len(prices))
+            if prices[i - 1] > 0
+        ]
+        if len(log_returns) < 4:
+            return None
+        mean = sum(log_returns) / len(log_returns)
+        variance = sum((r - mean) ** 2 for r in log_returns) / (len(log_returns) - 1)
+        return math.sqrt(variance)
 
     @staticmethod
     def _norm_cdf(x: float) -> float:
@@ -391,20 +445,43 @@ class CryptoPriceStrategy(BaseStrategy):
         if abs(spot - threshold) / spot > config.CRYPTO_NEAR_MONEY_PCT:
             return None
 
-        daily_vol = config.CRYPTO_DAILY_VOL.get(series, 0.04)
+        daily_vol = self._realized_vols.get(series, config.CRYPTO_DAILY_VOL.get(series, 0.04))
         hours = self._hours_to_expiry(market)
         prob_above = self._prob_above(spot, threshold, hours, daily_vol)
         prior = prob_above if direction == "above" else (1.0 - prob_above)
 
         orderbook = self.client.get_orderbook(ticker)
-        mid = self.client.mid_price(orderbook)
-        if mid is None:
+        bid = self.client.best_yes_bid(orderbook)
+        ask = self.client.best_yes_ask(orderbook)
+        if bid is None or ask is None:
             return None
 
+        # Skip illiquid markets with wide spreads — the mid is unreliable.
+        spread = ask - bid
+        if spread > config.CRYPTO_MAX_SPREAD_CENTS:
+            logger.debug(
+                f"SKIPPED {ticker}: spread={spread}c exceeds max {config.CRYPTO_MAX_SPREAD_CENTS}c"
+            )
+            return None
+
+        mid = (bid + ask) / 2
         market_prob = mid / 100
         edge = prior - market_prob
 
-        if abs(edge) < config.MIN_EDGE:
+        # Widen the edge threshold by half the spread in probability terms.
+        # A 3-cent spread requires MIN_EDGE + 0.015 rather than plain MIN_EDGE,
+        # because a wider spread means the mid is a less precise signal.
+        adjusted_min_edge = config.MIN_EDGE + (spread / 200)
+        if abs(edge) < adjusted_min_edge:
+            return None
+
+        # If model and market disagree by too much, the market likely has
+        # information we don't (momentum, news, order flow). Skip the trade.
+        if abs(edge) > config.MAX_MODEL_MARKET_DISAGREEMENT:
+            logger.info(
+                f"SKIPPED {ticker}: model={prior:.2f} market={market_prob:.2f} "
+                f"disagreement={abs(edge):.2f} exceeds cap of {config.MAX_MODEL_MARKET_DISAGREEMENT}"
+            )
             return None
 
         if edge > 0:
@@ -425,9 +502,9 @@ class CryptoPriceStrategy(BaseStrategy):
             contracts=contracts,
             limit_price=limit_price,
             reason=(
-                f"crypto_price | spot={spot:.0f} threshold={threshold:.0f} "
-                f"({direction}) prior={prior:.2f} market={market_prob:.2f} "
-                f"hours_left={hours:.1f}"
+                f"crypto_price | spot={spot:.0f} threshold={threshold:.0f} ({direction}) "
+                f"prior={prior:.2f} market={market_prob:.2f} "
+                f"vol={daily_vol:.4f} spread={spread}c hours_left={hours:.1f}"
             ),
             edge=abs(edge),
         )

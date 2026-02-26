@@ -1,0 +1,10 @@
+timestamp,ticker,strategy,side,action,contracts,limit_price_cents,cost_usd,edge,order_id,dry_run,reason
+2026-02-22 13:33:32,KXBTCD-26FEB2209-T67999.99,CryptoPriceStrategy,yes,buy,17,14,2.38,0.2719,894642fa-a2d8-4272-8d6f-3cdc09c085db,False,crypto_price | spot=67928 threshold=68000 (above) prior=0.41 market=0.14 hours_left=0.4
+2026-02-22 13:33:45,KXETH-26FEB2209-B1980,CryptoPriceStrategy,yes,buy,35,7,2.45,0.8283,8a741b09-6df1-4c99-92f4-5a205612ffb3,False,crypto_price | spot=1964 threshold=1980 (below) prior=0.90 market=0.07 hours_left=0.4
+2026-02-22 13:38:59,KXBTCD-26FEB2209-T67749.99,CryptoPriceStrategy,yes,buy,8,29,2.32,0.1690,0ea4a22c-b1c8-478e-857d-d145664c1c4e,False,crypto_price | spot=67724 threshold=67750 (above) prior=0.46 market=0.29 hours_left=0.4
+2026-02-22 13:39:10,KXETH-26FEB2209-B1980,CryptoPriceStrategy,yes,buy,25,10,2.50,0.8772,606a56f9-b288-4205-9240-6d8aa4a1dd54,False,crypto_price | spot=1959 threshold=1980 (below) prior=0.98 market=0.10 hours_left=0.3
+2026-02-22 13:44:23,KXBTCD-26FEB2217-T66999.99,MomentumStrategy,no,buy,10,23,2.30,0.1200,3f9e5ef6-5f99-4797-9f7a-c44e318ef346,False,momentum | net_move=-12c over 10 trades
+2026-02-22 13:44:34,KXETH-26FEB2209-B1980,CryptoPriceStrategy,yes,buy,27,9,2.43,0.8950,479259cc-cec2-4dcf-8f9e-b98c5c8d3b5a,False,crypto_price | spot=1947 threshold=1980 (below) prior=0.99 market=0.10 hours_left=0.3
+2026-02-23 16:09:16,KXETH-26FEB2317-B1970,CryptoPriceStrategy,yes,buy,22,11,2.42,0.8750,28873b2a-2bf0-48ba-8c81-faccdb374874,False,crypto_price | spot=1884 threshold=1970 (below) prior=0.99 market=0.12 hours_left=5.8
+2026-02-25 17:56:14,KXETH-26FEB2517-B2060,CryptoPriceStrategy,no,buy,4,54,2.16,0.1733,a27f142e-d624-4a76-9b1e-7e8f05e72fe1,False,crypto_price | spot=2075 threshold=2060 (below) prior=0.29 market=0.46 hours_left=4.1
+2026-02-26 02:17:34,KXETH-26FEB2617-B2080,CryptoPriceStrategy,yes,buy,10,23,2.30,0.4903,c0d28057-a207-43bc-a5f7-8304b424df7d,False,crypto_price | spot=2045 threshold=2080 (below) prior=0.72 market=0.23 hours_left=19.7

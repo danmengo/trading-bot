@@ -151,6 +151,30 @@ class KalshiClient:
         data = self._get("/portfolio/orders", params={"status": "resting"})
         return data.get("orders", [])
 
+    def get_fills(self, min_ts: int = None) -> list[dict]:
+        """
+        Fetch executed fills (matched trades).
+        min_ts is a Unix timestamp in seconds — pass today's midnight UTC
+        to filter to today's activity only.
+        """
+        params = {"limit": 1000}
+        if min_ts is not None:
+            params["min_ts"] = min_ts
+        data = self._get("/portfolio/fills", params=params)
+        return data.get("fills", [])
+
+    def get_settlements(self, min_ts: int = None) -> list[dict]:
+        """
+        Fetch settled positions.
+        min_ts is a Unix timestamp in seconds.
+        Each settlement includes 'revenue' (cents paid out) and 'ticker'.
+        """
+        params = {"limit": 1000}
+        if min_ts is not None:
+            params["min_ts"] = min_ts
+        data = self._get("/portfolio/settlements", params=params)
+        return data.get("settlements", [])
+
     # ── Spot prices ───────────────────────────────────────────────────────────
 
     def get_spot_prices(self) -> dict:
@@ -172,6 +196,25 @@ class KalshiClient:
             logger.warning(f"Failed to fetch spot prices: {e}")
             return {}
 
+    def get_price_history(self, coin_id: str, days: int = 30) -> list[float]:
+        """
+        Fetch daily closing prices from CoinGecko for realized vol calculation.
+        coin_id is the CoinGecko ID, e.g. 'bitcoin' or 'ethereum'.
+        Returns a list of closing prices, oldest first.
+        """
+        try:
+            resp = requests.get(
+                f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart",
+                params={"vs_currency": "usd", "days": days, "interval": "daily"},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return [point[1] for point in data.get("prices", [])]
+        except Exception as e:
+            logger.warning(f"Failed to fetch price history for {coin_id}: {e}")
+            return []
+
     # ── Helpers ───────────────────────────────────────────────────────────────
     # Kalshi orderbook structure:
     #   {"yes": [[price, size], ...], "no": [[price, size], ...]}
@@ -183,6 +226,11 @@ class KalshiClient:
         """Highest price (cents) a buyer will pay for YES."""
         yes_bids = orderbook.get("yes", [])
         return yes_bids[0][0] if yes_bids else None
+
+    def best_no_bid(self, orderbook: dict) -> Optional[int]:
+        """Highest price (cents) a buyer will pay for NO."""
+        no_bids = orderbook.get("no", [])
+        return no_bids[0][0] if no_bids else None
 
     def best_yes_ask(self, orderbook: dict) -> Optional[int]:
         """Lowest price (cents) a seller will accept for YES (implied from NO bids)."""

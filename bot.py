@@ -9,9 +9,10 @@ import logging
 import time
 from datetime import datetime, timezone, timedelta
 from kalshi_client import KalshiClient
-from strategy import MomentumStrategy, GeminiSentimentStrategy, CryptoPriceStrategy
+from strategy import GeminiSentimentStrategy, CryptoPriceStrategy
 from risk import RiskManager
 import config
+import trade_log
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,7 +32,6 @@ class TradingBot:
         # Add or remove strategies here
         self.strategies = [
             self.crypto_price_strategy,              # spot-price probability model
-            MomentumStrategy(self.client),           # intraday trade momentum
             GeminiSentimentStrategy(self.client),    # no-ops if GEMINI_API_KEY is empty
         ]
 
@@ -42,6 +42,10 @@ class TradingBot:
             if hasattr(s, "_calls_this_cycle"):
                 s._calls_this_cycle = 0
 
+        # Refresh realized P&L once per cycle so the daily loss limit is accurate
+        # even after positions settle and disappear from the portfolio.
+        self.risk.refresh_realized_pnl()
+
         balance = self.client.get_balance()
         logger.info(f"Balance: ${balance:.2f} | DRY_RUN={config.DRY_RUN}")
 
@@ -51,7 +55,8 @@ class TradingBot:
             logger.info(f"Spot prices: BTC=${spot_prices.get('KXBTCD', '?'):,.0f}  ETH=${spot_prices.get('KXETH', '?'):,.0f}")
         self.crypto_price_strategy.spot_prices = spot_prices
 
-        # Cancel stale resting orders and find series that still have open orders.
+        # Cancel stale resting orders and build busy_series from both resting orders
+        # AND filled portfolio positions — prevents stacking on the same underlying.
         try:
             open_orders = self.client.get_open_orders()
             cutoff = datetime.now(timezone.utc) - timedelta(minutes=config.ORDER_CANCEL_AFTER_MINUTES)
@@ -70,18 +75,36 @@ class TradingBot:
                             self.client.cancel_order(order_id)
                         except Exception as e:
                             logger.warning(f"Failed to cancel order {order_id}: {e}")
-                            remaining_orders.append(order)  # keep in busy list if cancel failed
+                            remaining_orders.append(order)
                         continue
                 remaining_orders.append(order)
 
+            # Fetch positions once — used for both stop-loss checks and busy_series.
+            try:
+                positions = self.client.get_portfolio()
+            except Exception as e:
+                logger.warning(f"Could not fetch portfolio positions: {e}")
+                positions = []
+
+            # Check stop-losses before scanning for new trades.
+            self._check_stops(positions, remaining_orders)
+
+            # Series with resting orders
             busy_series = {
                 ticker.split("-")[0]
                 for order in remaining_orders
                 for ticker in [order.get("ticker", "")]
                 if ticker
             }
+
+            # Also block series where we already hold a filled position.
+            for pos in positions:
+                ticker = pos.get("ticker", "")
+                if ticker:
+                    busy_series.add(ticker.split("-")[0])
+
             if busy_series:
-                logger.info(f"Skipping series with resting orders: {busy_series}")
+                logger.info(f"Skipping series with existing orders/positions: {busy_series}")
         except Exception as e:
             logger.warning(f"Could not fetch open orders: {e}")
             busy_series = set()
@@ -97,18 +120,23 @@ class TradingBot:
                 logger.error(f"Failed to fetch markets for {series}: {e}")
                 continue
 
-            # Filter by days to expiry
-            max_days = config.SERIES_MAX_DAYS_TO_EXPIRY.get(series, 7)
-            if max_days > 0:
-                now = datetime.now(timezone.utc)
-                def days_to_expiry(m):
-                    t = m.get("close_time") or m.get("expiration_time")
-                    if not t:
-                        return float("inf")
-                    return (datetime.fromisoformat(t.replace("Z", "+00:00")) - now).total_seconds() / 86400
-                markets = [m for m in markets if days_to_expiry(m) <= max_days]
+            # Filter by time to expiry — only trade within the configured window.
+            # Too close: model breaks down. Too far: probabilities compress toward 50%.
+            now = datetime.now(timezone.utc)
+            def hours_to_expiry(m):
+                t = m.get("close_time") or m.get("expiration_time")
+                if not t:
+                    return float("inf")
+                return (datetime.fromisoformat(t.replace("Z", "+00:00")) - now).total_seconds() / 3600
+            markets = [
+                m for m in markets
+                if config.MIN_HOURS_TO_EXPIRY <= hours_to_expiry(m) <= config.MAX_HOURS_TO_EXPIRY
+            ]
 
-            logger.info(f"Found {len(markets)} open markets in series '{series}' (within {max_days}d)")
+            logger.info(
+                f"Found {len(markets)} open markets in series '{series}' "
+                f"(window: {config.MIN_HOURS_TO_EXPIRY}–{config.MAX_HOURS_TO_EXPIRY}h to expiry)"
+            )
 
             # Find the best signal across all markets in this series and execute it.
             # One trade per series per cycle prevents correlated bets on the same underlying.
@@ -151,6 +179,7 @@ class TradingBot:
                     price_cents=best_signal.limit_price,
                 )
                 logger.info(f"Order result: {result}")
+                trade_log.log_trade(best_signal, best_strategy_name, result, config.DRY_RUN)
             except Exception as e:
                 logger.error(f"Order failed for {best_signal.ticker}: {e}")
 
@@ -165,6 +194,84 @@ class TradingBot:
                 self._trade_market(market)
             except Exception as e:
                 logger.error(f"Failed to fetch ticker {ticker}: {e}")
+
+    def _check_stops(self, positions: list, open_orders: list):
+        """
+        Check all open positions for stop-loss conditions each cycle.
+        Exits at the best available bid for our side — never at mid, since
+        on Kalshi you can only sell at what buyers are willing to pay.
+
+        Kalshi field mapping (from debug_positions.py):
+          position        → number of contracts held (0 = closed/historical, skip)
+          market_exposure → cost basis of the current position in cents
+          Current value is not provided — fetched live from the orderbook.
+
+        Skips any position that already has a pending sell order to avoid
+        stacking duplicate exits across cycles.
+        """
+        # Don't re-submit a sell if one is already resting for this ticker.
+        pending_sells = {
+            order.get("ticker")
+            for order in open_orders
+            if order.get("action") == "sell"
+        }
+
+        for pos in positions:
+            ticker = pos.get("ticker", "")
+            if not ticker or ticker in pending_sells:
+                continue
+
+            # position = 0 means the position is closed or historical — skip it.
+            count = pos.get("position", 0)
+            if count == 0:
+                continue
+
+            # market_exposure = cost basis in cents for the contracts currently held.
+            cost_cents = pos.get("market_exposure", 0)
+            if cost_cents <= 0:
+                continue
+
+            # Positive position = YES contracts. Negative would be NO.
+            side = "yes" if count > 0 else "no"
+            count = abs(count)
+
+            # Fetch orderbook to get both the current bid (exit price) and
+            # current market value — Kalshi doesn't provide mark-to-market in portfolio.
+            orderbook = self.client.get_orderbook(ticker)
+            if side == "yes":
+                bid = self.client.best_yes_bid(orderbook)
+            else:
+                bid = self.client.best_no_bid(orderbook)
+
+            if not bid or bid <= 0:
+                logger.warning(
+                    f"STOP-LOSS: no {side} bid for {ticker} — cannot exit, will retry next cycle"
+                )
+                continue
+
+            # Current value = what we'd receive if we sold at the best bid right now.
+            current_value_cents = bid * count
+            loss_pct = (cost_cents - current_value_cents) / cost_cents
+
+            if loss_pct < config.STOP_LOSS_PCT:
+                continue
+
+            logger.info(
+                f"STOP-LOSS triggered {ticker} | {side.upper()} {count}x | "
+                f"paid=${cost_cents / 100:.2f} now=${current_value_cents / 100:.2f} "
+                f"loss={loss_pct:.0%} → selling at {bid}c"
+            )
+            try:
+                result = self.client.place_order(
+                    ticker=ticker,
+                    side=side,
+                    action="sell",
+                    contracts=count,
+                    price_cents=bid,
+                )
+                logger.info(f"Stop-loss order result: {result}")
+            except Exception as e:
+                logger.error(f"Stop-loss order failed for {ticker}: {e}")
 
     def _trade_market(self, market: dict):
         """Evaluate all strategies on a single market and execute the best signal."""
@@ -207,6 +314,7 @@ class TradingBot:
                 price_cents=best_signal.limit_price,
             )
             logger.info(f"Order result: {result}")
+            trade_log.log_trade(best_signal, best_strategy_name, result, config.DRY_RUN)
         except Exception as e:
             logger.error(f"Order failed for {ticker}: {e}")
 
